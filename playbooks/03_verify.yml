@@ -1,0 +1,74 @@
+---
+# =====================================================================
+#  03_verify.yml - Health check rapido delle UAG (nessuna modifica)
+#  Uso: ansible-playbook playbooks/03_verify.yml
+# =====================================================================
+- name: Verifica UAG
+  hosts: uag
+  gather_facts: false
+  vars:
+    api_base: "https://{{ uag_mgmt_ip }}:9443/rest/v1"
+  tasks:
+    - name: Stats edge service
+      ansible.builtin.uri:
+        url: "{{ api_base }}/monitor/stats"
+        method: GET
+        user: "{{ uag_api_user }}"
+        password: "{{ uag_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+      register: stats
+
+    - name: Versione e impostazioni generali
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/general"
+        method: GET
+        user: "{{ uag_api_user }}"
+        password: "{{ uag_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+      register: general
+
+    - name: System settings (quiesce?)
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/system"
+        method: GET
+        user: "{{ uag_api_user }}"
+        password: "{{ uag_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+      register: system
+
+    - name: Certificato Internet
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/certs/ssl/details/end_user"
+        method: GET
+        user: "{{ uag_api_user }}"
+        password: "{{ uag_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+      register: cert_internet
+
+    - name: Certificato Admin
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/certs/ssl/details/admin"
+        method: GET
+        user: "{{ uag_api_user }}"
+        password: "{{ uag_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+      register: cert_admin
+
+    - name: Riepilogo {{ inventory_hostname }}
+      ansible.builtin.debug:
+        msg:
+          - "Quiesce mode: {{ system.json.quiesceMode | default('n/d') }}"
+          - "Horizon edge configurato: {{ '<viewConfigured>true' in stats.content }}"
+          - "Sessioni attive (estratto stats): {{ stats.content | regex_search('<activeSessions>[^<]*</activeSessions>') | default('n/d') }}"
+          - "Cert Internet: {{ cert_internet.json | default({}) }}"
+          - "Cert Admin:    {{ cert_admin.json | default({}) }}"

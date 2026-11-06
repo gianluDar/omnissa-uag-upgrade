@@ -1,0 +1,96 @@
+---
+# =====================================================================
+#  01_export.yml - Backup della configurazione delle UAG in esercizio
+#
+#  Scarica da ogni UAG via API REST (porta 9443):
+#    - settings in JSON   (base per il template settings/<uag>.json.j2)
+#    - settings in INI    (utile per uagdeploy.ps1 o per confronto)
+#    - dettagli certificato internet + admin
+#    - log archive (support bundle)
+#  Salva tutto in files/backup/<data>/<uag>/
+#
+#  Uso:  ansible-playbook playbooks/01_export.yml
+#        ansible-playbook playbooks/01_export.yml -l uag1
+# =====================================================================
+- name: Export configurazione UAG
+  hosts: uag
+  gather_facts: false
+  vars:
+    backup_ts: "{{ lookup('pipe', 'date +%Y%m%d-%H%M') }}"
+    backup_dir: "{{ playbook_dir }}/../files/backup/{{ backup_ts }}/{{ inventory_hostname }}"
+    api_base: "https://{{ uag_mgmt_ip }}:9443/rest/v1"
+
+  tasks:
+    - name: Crea cartella di backup
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Scarica settings (JSON)
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/settings?format=JSON"
+        method: GET
+        user: "{{ uag_api_user }}"
+        password: "{{ uag_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+      register: settings_json
+
+    - name: Salva settings JSON
+      ansible.builtin.copy:
+        content: "{{ settings_json.json | to_nice_json }}"
+        dest: "{{ backup_dir }}/settings.json"
+        mode: "0600"
+
+    - name: Scarica settings (INI)
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/settings?format=INI"
+        method: GET
+        user: "{{ uag_api_user }}"
+        password: "{{ uag_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+        dest: "{{ backup_dir }}/settings.ini"
+        mode: "0600"
+
+    - name: Dettagli certificato interfaccia Internet
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/certs/ssl/details/end_user"
+        method: GET
+        user: "{{ uag_api_user }}"
+        password: "{{ uag_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+        dest: "{{ backup_dir }}/cert-internet-details.json"
+
+    - name: Dettagli certificato interfaccia Admin
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/certs/ssl/details/admin"
+        method: GET
+        user: "{{ uag_api_user }}"
+        password: "{{ uag_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+        dest: "{{ backup_dir }}/cert-admin-details.json"
+
+    - name: Scarica log archive (support bundle)
+      ansible.builtin.uri:
+        url: "{{ api_base }}/monitor/support-archive"
+        method: GET
+        user: "{{ uag_api_user }}"
+        password: "{{ uag_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        dest: "{{ backup_dir }}/support-archive.zip"
+        timeout: 300
+
+    - name: Riepilogo
+      ansible.builtin.debug:
+        msg:
+          - "Backup salvato in {{ backup_dir }}"
+          - "Prossimo passo: copia settings.json in templates/{{ uag_settings_template }} e sostituisci i segreti (vedi README, sezione 4)"

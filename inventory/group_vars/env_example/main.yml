@@ -1,0 +1,23 @@
+---
+# =====================================================================
+#  Ambiente di esempio: copia questa cartella come group_vars/<gruppo>
+#  e rinomina il gruppo in hosts.yml. Segreti in vault.yml (cifrato).
+# =====================================================================
+uag_env: "example"            # cartella certificati: files/certs/<uag_env>/
+
+# uag_os_login_username: ""   # vuoto = root. Es. "uagadmin": utente sudo al posto di root (password = vault_uag_root_password)
+
+# ---------- vCenter ----------
+vcenter_hostname: "vcenter.example.com"   # deve risolvere dal control node (o IP)
+vcenter_datacenter: "DC1"
+vcenter_cluster: "Cluster-DMZ"            # oppure usa vcenter_esxi_host
+vcenter_datastore: "datastore1"
+vcenter_folder: ""                        # es. "/DC1/vm/DMZ" - vuoto = root
+
+# ---------- Rete ----------
+# Tutti e tre i port group devono ESISTERE in vCenter anche con onenic (il modulo li valida).
+uag_net_internet: "PG-DMZ"
+uag_net_management: "PG-DMZ"
+uag_net_backend: "PG-DMZ"
+uag_dns: "10.0.0.53 10.0.0.54"            # separati da spazio (dall'export: systemSettings.dns)
+uag_dns_search: "example.com"             # dall'export: systemSettings.dnsSearch

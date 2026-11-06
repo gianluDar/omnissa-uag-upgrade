@@ -1,0 +1,688 @@
+---
+# =====================================================================
+#  02_upgrade.yml - Upgrade UAG (redeploy) UNA ALLA VOLTA
+#
+#  Per ogni UAG (serial: 1):
+#    1. Pre-check: file presenti (OVA, certificati, template settings)
+#    2. Quiesce della UAG in esercizio + attesa
+#    3. Spegne e rinomina la vecchia VM (rollback) oppure la elimina
+#    4. Deploy della nuova OVA con proprieta' OVF (rete, password)
+#    5. Attende che l'API admin risponda
+#    6. Carica certificato TLS Internet (end_user) e Admin
+#    7. Applica la configurazione (PUT settings) dal template
+#       (i metadati IdP SAML sono gia' dentro il JSON esportato)
+#    8. Verifica stato edge service e certificati
+#    9. Si FERMA e chiede conferma prima di passare alla UAG successiva
+#
+#  Uso:
+#    ansible-playbook playbooks/02_upgrade.yml                # tutte, in sequenza
+#    ansible-playbook playbooks/02_upgrade.yml -l uag1        # solo una
+#    ansible-playbook playbooks/02_upgrade.yml --check        # dry-run (solo pre-check)
+#    ansible-playbook playbooks/02_upgrade.yml --tags deploy  # salta quiesce (UAG gia' fuori LB)
+# =====================================================================
+- name: Upgrade UAG
+  hosts: uag
+  gather_facts: false
+  serial: 1
+  vars:
+    api_base: "https://{{ uag_mgmt_ip }}:9443/rest/v1"
+    api_auth: &api_auth
+      user: "{{ uag_api_user }}"
+      password: "{{ uag_admin_password }}"
+      force_basic_auth: true
+      validate_certs: false
+    old_vm_name: "{{ uag_vm_name }}_OLD_{{ lookup('pipe', 'date +%Y%m%d') }}"
+
+  pre_tasks:
+    # ------------------------------------------------------------------
+    # 1. PRE-CHECK
+    # ------------------------------------------------------------------
+    # Il template settings viene generato automaticamente dall'ultimo export
+    # (files/backup/<data>/<host>/settings.json) se non esiste. Se esiste, NON viene
+    # toccato (puo' avere modifiche a mano, es. metadati IdP aggiornati);
+    # per rigenerarlo: -e uag_regenerate_template=true
+    - name: "[precheck] Cerca l'ultimo export di {{ inventory_hostname }} in files/backup/"
+      ansible.builtin.find:
+        paths: "{{ playbook_dir }}/../files/backup"
+        patterns: "settings.json"
+        recurse: true
+      register: exports_found
+      tags: [always]
+
+    - name: "[precheck] Seleziona l'export piu' recente"
+      ansible.builtin.set_fact:
+        latest_export: >-
+          {{ (exports_found.files
+              | selectattr('path', 'search', '/' ~ inventory_hostname ~ '/settings.json$')
+              | sort(attribute='path') | map(attribute='path') | list | last) | default('', true) }}
+      tags: [always]
+
+    - name: "[precheck] Esiste gia' il template settings?"
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../templates/{{ uag_settings_template }}"
+      register: tpl_stat
+      tags: [always]
+
+    - name: "[precheck] Nessun template e nessun export: serve prima 01_export.yml"
+      ansible.builtin.fail:
+        msg: >-
+          Manca templates/{{ uag_settings_template }} e non c'e' nessun export di {{ inventory_hostname }}
+          in files/backup/. Lancia prima: ansible-playbook playbooks/01_export.yml -l {{ inventory_hostname }}
+      when: not tpl_stat.stat.exists and latest_export == ''
+      tags: [always]
+
+    - name: "[precheck] Genera il template settings dall'export {{ latest_export | basename }} ({{ latest_export | dirname | dirname | basename }})"
+      ansible.builtin.command:
+        argv:
+          - "{{ playbook_dir }}/../scripts/make_settings_template.py"
+          - "{{ latest_export }}"
+      register: tpl_gen
+      when: (not tpl_stat.stat.exists) or (uag_regenerate_template | default(false) | bool)
+      changed_when: true
+      check_mode: false
+      tags: [always]
+
+    - name: "[precheck] Scrivi il template generato in templates/{{ uag_settings_template }}"
+      ansible.builtin.copy:
+        content: "{{ tpl_gen.stdout }}\n"
+        dest: "{{ playbook_dir }}/../templates/{{ uag_settings_template }}"
+        mode: "0600"
+      when: tpl_gen is not skipped
+      check_mode: false
+      tags: [always]
+
+    - name: "[precheck] Fix applicati da make_settings_template.py"
+      ansible.builtin.debug:
+        msg: "{{ tpl_gen.stderr_lines | default([]) }}"
+      when: tpl_gen is not skipped
+      tags: [always]
+
+    - name: "[precheck] Verifica presenza file richiesti"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      register: req_files
+      loop:
+        - "{{ uag_ova }}"
+        - "{{ uag_cert_internet_chain }}"
+        - "{{ uag_cert_internet_key }}"
+        - "{{ playbook_dir }}/../templates/{{ uag_settings_template }}"
+      tags: [always]
+
+    - name: "[precheck] Fallisci se manca un file"
+      ansible.builtin.assert:
+        that: item.stat.exists
+        fail_msg: "File mancante: {{ item.item }}"
+        quiet: true
+      loop: "{{ req_files.results }}"
+      loop_control:
+        label: "{{ item.item | basename }}"
+      tags: [always]
+
+    - name: "[precheck] Verifica file certificato admin (se abilitato)"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      register: admin_cert_files
+      loop:
+        - "{{ uag_cert_admin_chain }}"
+        - "{{ uag_cert_admin_key }}"
+      failed_when: not admin_cert_files.stat.exists
+      when: uag_cert_admin_enabled | bool
+      tags: [always]
+
+    - name: "[precheck] Leggi le deployment option disponibili nella OVA"
+      ansible.builtin.shell: |
+        set -o pipefail
+        n=$(tar -tf "{{ uag_ova }}" | grep -m1 '\.ovf$')
+        tar -xOf "{{ uag_ova }}" "$n" | grep -o '<Configuration ovf:id="[^"]*"' | sed 's/.*id="\([^"]*\)"/\1/'
+      args:
+        executable: /bin/bash
+      register: ova_deploy_options
+      changed_when: false
+      check_mode: false
+      tags: [always]
+
+    - name: "[precheck] Verifica che uag_deployment_option='{{ uag_deployment_option }}' esista nella OVA"
+      ansible.builtin.assert:
+        that: uag_deployment_option in ova_deploy_options.stdout_lines
+        fail_msg: >-
+          uag_deployment_option='{{ uag_deployment_option }}' non esiste nella OVA.
+          Valori validi: {{ ova_deploy_options.stdout_lines | join(', ') }}
+          (impostalo in group_vars, host_vars o con -e uag_deployment_option=...)
+        success_msg: "deployment option '{{ uag_deployment_option }}' OK (disponibili: {{ ova_deploy_options.stdout_lines | join(', ') }})"
+      tags: [always]
+
+    - name: "[precheck] Verifica che chiave e certificato Internet corrispondano"
+      ansible.builtin.shell: |
+        set -o pipefail
+        c=$(openssl x509 -noout -pubkey -in "{{ uag_cert_internet_chain }}" | openssl md5)
+        k=$(openssl pkey -pubout -in "{{ uag_cert_internet_key }}" | openssl md5)
+        [ "$c" = "$k" ] && echo MATCH || { echo MISMATCH; exit 1; }
+      args:
+        executable: /bin/bash
+      changed_when: false
+      check_mode: false
+      tags: [always]
+
+    - name: "[precheck] Analizza il template settings (cosa c'e', cosa manca)"
+      ansible.builtin.command:
+        argv:
+          - "{{ playbook_dir }}/../scripts/inspect_export.py"
+          - "{{ playbook_dir }}/../templates/{{ uag_settings_template }}"
+          - "--strict"
+      register: inspect
+      changed_when: false
+      check_mode: false
+      failed_when: inspect.rc != 0
+      tags: [always]
+
+    - name: "[precheck] Esito analisi template"
+      ansible.builtin.debug:
+        msg: "{{ inspect.stdout_lines }}"
+      tags: [always]
+
+    - name: "[precheck] Render del template settings (valida la sintassi JSON e le variabili vault)"
+      ansible.builtin.set_fact:
+        uag_settings_body: "{{ lookup('template', playbook_dir ~ '/../templates/' ~ uag_settings_template) | from_json }}"
+      tags: [always]
+
+    - name: "[precheck] Cerca la VM attuale"
+      community.vmware.vmware_guest_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        datacenter: "{{ vcenter_datacenter }}"
+        name: "{{ uag_vm_name }}"
+      register: old_vm
+      # Tollera SOLO "VM non trovata" (primo deploy); ogni altro errore (librerie
+      # Python mancanti, credenziali vCenter, ...) deve fermare il playbook.
+      failed_when:
+        - old_vm.failed | default(false)
+        - "'not find' not in (old_vm.msg | default('')) and 'not found' not in (old_vm.msg | default('')) and 'Unable to gather' not in (old_vm.msg | default(''))"
+      tags: [always]
+
+    - name: "[precheck] Cerca una VM {{ uag_vm_name }}_NEW residua (deploy precedente interrotto)"
+      community.vmware.vmware_guest_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        datacenter: "{{ vcenter_datacenter }}"
+        name: "{{ uag_vm_name }}_NEW"
+      register: leftover_vm
+      failed_when: false
+      tags: [always]
+
+    - name: "[precheck] Blocca se esiste gia' {{ uag_vm_name }}_NEW"
+      ansible.builtin.fail:
+        msg: "In vCenter esiste gia' una VM '{{ uag_vm_name }}_NEW' (deploy precedente interrotto). Eliminala o rinominala, poi rilancia."
+      when: leftover_vm.instance is defined
+      tags: [always]
+
+    - name: "[precheck] Esito ricerca"
+      ansible.builtin.debug:
+        msg: "{{ 'VM trovata: ' ~ uag_vm_name ~ ' (' ~ old_vm.instance.hw_processor_count ~ ' vCPU, ' ~ old_vm.instance.hw_memtotal_mb ~ ' MB, ' ~ old_vm.instance.hw_power_status ~ ')' if old_vm.instance is defined else 'VM ' ~ uag_vm_name ~ ' NON trovata in vCenter: nessuna VM da spegnere/rinominare (primo deploy?)' }}"
+      tags: [always]
+
+    - name: "[precheck] Conferma se la VM attuale non e' stata trovata"
+      ansible.builtin.pause:
+        prompt: "ATTENZIONE: nessuna VM '{{ uag_vm_name }}' in vCenter. Controlla uag_vm_name. INVIO per deployare comunque, Ctrl+C poi A per abortire"
+      when: old_vm.instance is not defined
+      tags: [always]
+
+    - name: "[precheck] Risorse della VM attuale (usate come default per la nuova)"
+      ansible.builtin.set_fact:
+        old_vm_cpus: "{{ old_vm.instance.hw_processor_count }}"
+        old_vm_memory_mb: "{{ old_vm.instance.hw_memtotal_mb }}"
+      when: old_vm.instance is defined
+      tags: [always]
+
+    - name: "[precheck] Taglia della nuova VM: vCPU"
+      ansible.builtin.set_fact:
+        new_vm_cpus: "{{ uag_vm_cpus | default(old_vm_cpus) | int }}"
+      when: uag_vm_cpus is defined or old_vm_cpus is defined
+      tags: [always]
+
+    - name: "[precheck] Taglia della nuova VM: RAM"
+      ansible.builtin.set_fact:
+        new_vm_memory_mb: "{{ uag_vm_memory_mb | default(old_vm_memory_mb) | int }}"
+      when: uag_vm_memory_mb is defined or old_vm_memory_mb is defined
+      tags: [always]
+
+    - name: "[precheck] Riepilogo taglia"
+      ansible.builtin.debug:
+        msg: >-
+          Vecchia VM: {{ old_vm_cpus | default('?') }} vCPU / {{ old_vm_memory_mb | default('?') }} MB ->
+          nuova VM: {{ new_vm_cpus | default('default OVA') }} vCPU / {{ new_vm_memory_mb | default('default OVA') }} MB
+          ({{ 'da uag_vm_cpus/uag_vm_memory_mb' if (uag_vm_cpus is defined or uag_vm_memory_mb is defined) else 'ereditate dalla vecchia VM' }})
+      tags: [always]
+
+    - name: "[precheck] Riepilogo"
+      ansible.builtin.debug:
+        msg:
+          - "UAG:            {{ inventory_hostname }} ({{ uag_vm_name }} / {{ uag_mgmt_ip }})"
+          - "OVA:            {{ uag_ova | basename }}"
+          - "Versione:       {{ uag_version }}"
+          - "Vecchia VM ->   {{ 'rinominata in ' + old_vm_name if uag_keep_old_vm else 'ELIMINATA' }}"
+          - "Cert admin:     {{ 'si' if uag_cert_admin_enabled else 'no (self-signed)' }}"
+          - "Utente OS:      {{ (uag_os_login_username | default('')) or 'root' }}{{ ' (root disabilitato)' if (uag_os_login_username | default('')) else '' }} / admin UI: admin"
+          - "VM attuale:     {{ ('trovata, ' ~ old_vm_cpus ~ ' vCPU / ' ~ old_vm_memory_mb ~ ' MB, ' ~ old_vm.instance.hw_power_status) if old_vm.instance is defined else 'NON TROVATA in vCenter' }}"
+          - "Nuova VM:       {{ new_vm_cpus | default('default OVA') }} vCPU / {{ new_vm_memory_mb | default('default OVA') }} MB (deployment_option={{ uag_deployment_option }})"
+      tags: [always]
+
+    - name: "[precheck] Stop in check-mode"
+      ansible.builtin.meta: end_host
+      when: ansible_check_mode
+      tags: [always]
+
+    - name: "[precheck] Conferma operatore"
+      ansible.builtin.pause:
+        prompt: |
+          Sto per aggiornare {{ inventory_hostname }} alla {{ uag_version }}.
+          Primo passo: deploy della nuova VM {{ uag_vm_name }}_NEW (spenta, nessun impatto sul servizio).
+          Premi INVIO per continuare o Ctrl+C poi A per abortire
+      tags: [always]
+
+  tasks:
+    # ------------------------------------------------------------------
+    # 2. DEPLOY nuova OVA (PRIMA di toccare la vecchia!)
+    #    La nuova VM viene creata SPENTA con nome temporaneo <nome>_NEW: cosi' un
+    #    errore di deploy (rete/datastore inesistente, proprieta' OVF, upload) non
+    #    tocca il servizio. Solo se il deploy riesce si passa a quiesce/spegnimento
+    #    della vecchia, rinomina e accensione della nuova.
+    #    I nomi delle proprieta' OVF e delle reti vanno verificati con
+    #    scripts/ovf_props.sh sulla OVA scaricata (vedi README).
+    # ------------------------------------------------------------------
+    - name: "[deploy] Deploy OVA {{ uag_version }} -> {{ uag_vm_name }}_NEW (spenta)"
+      community.vmware.vmware_deploy_ovf:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        datacenter: "{{ vcenter_datacenter }}"
+        cluster: "{{ vcenter_cluster }}"
+        datastore: "{{ vcenter_datastore }}"
+        folder: "{{ vcenter_folder | default(omit, true) }}"
+        name: "{{ uag_vm_name }}_NEW"
+        ovf: "{{ uag_ova }}"
+        disk_provisioning: "{{ uag_disk_provisioning }}"
+        deployment_option: "{{ uag_deployment_option }}"
+        networks:
+          Internet: "{{ uag_net_internet }}"
+          ManagementNetwork: "{{ uag_net_management }}"
+          BackendNetwork: "{{ uag_net_backend }}"
+        properties:
+          uagName: "{{ uag_name | default(uag_vm_name) }}"
+          ipMode0: "STATICV4"
+          ip0: "{{ uag_ip0 }}"
+          netmask0: "{{ uag_netmask0 }}"
+          defaultGateway: "{{ uag_gateway }}"
+          DNS: "{{ uag_dns }}"
+          dnsSearch: "{{ uag_dns_search }}"
+          # Utente OS per la console/SSH. Se valorizzato, la OVA crea un utente sudo con
+          # quel nome, gli assegna rootPassword e DISABILITA il login root. Vuoto = root.
+          osLoginUsername: "{{ uag_os_login_username | default('') }}"
+          rootPassword: "{{ uag_root_password }}"
+          adminPassword: "{{ uag_admin_password }}"
+          # proprieta' OVF di tipo boolean: vCenter accetta solo 'True'/'False' (non 'true'/'false')
+          ceipEnabled: "{{ 'True' if (uag_ceip_enabled | bool) else 'False' }}"
+          sshEnabled: "{{ 'True' if (uag_ssh_enabled | bool) else 'False' }}"
+        power_on: false       # accesa dopo il resize (sotto)
+        wait: true
+        wait_for_ip_address: false
+        allow_duplicates: false
+        fail_on_spec_warnings: false
+      register: deploy
+      no_log: true          # la proprieta' contiene le password
+      tags: [deploy]
+
+    - name: "[deploy] Imposta vCPU/RAM della nuova VM ({{ new_vm_cpus | default('default OVA') }} vCPU / {{ new_vm_memory_mb | default('default OVA') }} MB)"
+      community.vmware.vmware_guest:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        datacenter: "{{ vcenter_datacenter }}"
+        name: "{{ uag_vm_name }}_NEW"
+        hardware:
+          num_cpus: "{{ new_vm_cpus | default(omit) }}"
+          memory_mb: "{{ new_vm_memory_mb | default(omit) }}"
+      when: new_vm_cpus is defined or new_vm_memory_mb is defined
+      tags: [deploy]
+
+    - name: "[deploy] Esito deploy"
+      ansible.builtin.debug:
+        msg: "VM {{ uag_vm_name }}_NEW deployata (spenta). Ora quiesce e spegnimento della vecchia."
+      tags: [deploy]
+
+    - name: "[deploy] Conferma prima di toccare la UAG in esercizio"
+      ansible.builtin.pause:
+        prompt: |
+          {{ uag_vm_name }}_NEW e' pronta (spenta). Da qui in poi il servizio su {{ inventory_hostname }} viene interrotto:
+          quiesce -> spegnimento -> rinomina in {{ old_vm_name }} -> accensione della nuova.
+          TOGLI ORA la UAG dal bilanciatore, poi premi INVIO (Ctrl+C poi A per abortire: la _NEW resta spenta in vCenter)
+      tags: [deploy, quiesce]
+
+    # ------------------------------------------------------------------
+    # 3. QUIESCE della UAG in esercizio
+    # ------------------------------------------------------------------
+    - name: "[quiesce] Leggi system settings attuali"
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/system"
+        method: GET
+        <<: *api_auth
+        return_content: true
+        status_code: [200, -1]
+        timeout: 20
+      register: sys_now
+      tags: [quiesce]
+
+    - name: "[quiesce] Abilita quiesce mode"
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/system"
+        method: PUT
+        <<: *api_auth
+        body_format: json
+        body: "{{ sys_now.json | combine({'quiesceMode': true}) }}"
+        status_code: [200]
+      when: sys_now.status == 200
+      tags: [quiesce]
+
+    - name: "[quiesce] Attendi drain sessioni ({{ uag_quiesce_wait_seconds }}s)"
+      ansible.builtin.pause:
+        seconds: "{{ uag_quiesce_wait_seconds }}"
+      when: sys_now.status == 200
+      tags: [quiesce]
+
+    # ------------------------------------------------------------------
+    # 4. VECCHIA VM: spegni + rinomina (o elimina), poi la NUOVA prende il nome e si accende
+    # ------------------------------------------------------------------
+    - name: "[oldvm] Spegni la VM attuale"
+      community.vmware.vmware_guest_powerstate:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        uuid: "{{ old_vm.instance.hw_product_uuid }}"
+        state: powered-off
+        force: true
+      when: old_vm.instance is defined
+      tags: [oldvm, deploy]
+
+    - name: "[oldvm] Rinomina la VM attuale in {{ old_vm_name }} (rollback)"
+      community.vmware.vmware_guest:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        datacenter: "{{ vcenter_datacenter }}"
+        uuid: "{{ old_vm.instance.hw_product_uuid }}"
+        name: "{{ old_vm_name }}"
+        state: present
+      when:
+        - old_vm.instance is defined
+        - uag_keep_old_vm | bool
+      tags: [oldvm, deploy]
+
+    - name: "[oldvm] Elimina la VM attuale (uag_keep_old_vm=false)"
+      community.vmware.vmware_guest:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        datacenter: "{{ vcenter_datacenter }}"
+        uuid: "{{ old_vm.instance.hw_product_uuid }}"
+        state: absent
+        force: true
+      when:
+        - old_vm.instance is defined
+        - not (uag_keep_old_vm | bool)
+      tags: [oldvm, deploy]
+
+    - name: "[deploy] Rinomina la nuova VM con il nome definitivo"
+      block:
+        - name: "[deploy] Leggi UUID della VM _NEW"
+          community.vmware.vmware_guest_info:
+            hostname: "{{ vcenter_hostname }}"
+            username: "{{ vcenter_username }}"
+            password: "{{ vcenter_password }}"
+            validate_certs: "{{ vcenter_validate_certs }}"
+            datacenter: "{{ vcenter_datacenter }}"
+            name: "{{ uag_vm_name }}_NEW"
+          register: new_vm
+        - name: "[deploy] Rinomina {{ uag_vm_name }}_NEW -> {{ uag_vm_name }} (per UUID)"
+          community.vmware.vmware_guest:
+            hostname: "{{ vcenter_hostname }}"
+            username: "{{ vcenter_username }}"
+            password: "{{ vcenter_password }}"
+            validate_certs: "{{ vcenter_validate_certs }}"
+            datacenter: "{{ vcenter_datacenter }}"
+            uuid: "{{ new_vm.instance.hw_product_uuid }}"
+            name: "{{ uag_vm_name }}"
+            state: present
+      tags: [deploy]
+
+    - name: "[deploy] Accendi la nuova VM {{ uag_vm_name }}"
+      community.vmware.vmware_guest_powerstate:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        name: "{{ uag_vm_name }}"
+        state: powered-on
+      tags: [deploy]
+
+    # ------------------------------------------------------------------
+    # 5. ATTESA API ADMIN
+    # ------------------------------------------------------------------
+    - name: "[wait] Attendi che l'API admin risponda su {{ uag_mgmt_ip }}:9443"
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/general"
+        method: GET
+        <<: *api_auth
+        status_code: [200]
+        timeout: 10
+      register: api_up
+      until: api_up.status == 200
+      retries: "{{ uag_api_wait_retries }}"
+      delay: "{{ uag_api_wait_delay }}"
+      tags: [deploy, configure]
+
+    # ------------------------------------------------------------------
+    # 6. CERTIFICATI TLS
+    #    end_user = interfaccia Internet (443, Blast, PCoIP)
+    #    admin    = interfaccia Admin (9443)
+    # ------------------------------------------------------------------
+    - name: "[cert] Carica certificato interfaccia INTERNET (end_user)"
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/certs/ssl/end_user"
+        method: PUT
+        <<: *api_auth
+        body_format: json
+        body:
+          privateKeyPem: "{{ lookup('file', uag_cert_internet_key) }}"
+          certChainPem: "{{ lookup('file', uag_cert_internet_chain) }}"
+        status_code: [200]
+        timeout: 60
+      no_log: true
+      tags: [configure, cert]
+
+    - name: "[cert] Carica certificato interfaccia ADMIN"
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/certs/ssl/admin"
+        method: PUT
+        <<: *api_auth
+        body_format: json
+        body:
+          privateKeyPem: "{{ lookup('file', uag_cert_admin_key) }}"
+          certChainPem: "{{ lookup('file', uag_cert_admin_chain) }}"
+        status_code: [200]
+        timeout: 60
+      when: uag_cert_admin_enabled | bool
+      no_log: true
+      tags: [configure, cert]
+
+    - name: "[cert] Attendi riavvio servizio admin dopo cambio cert (9443)"
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/general"
+        method: GET
+        <<: *api_auth
+        status_code: [200]
+        timeout: 10
+      register: api_up2
+      until: api_up2.status == 200
+      retries: 20
+      delay: 10
+      when: uag_cert_admin_enabled | bool
+      tags: [configure, cert]
+
+    # ------------------------------------------------------------------
+    # 7. CONFIGURAZIONE (PUT settings)
+    #    Include: edge Horizon, auth methods, metadati IdP (inline), OPSWAT, syslog...
+    # ------------------------------------------------------------------
+    # La PUT puo' cambiare cipher/TLS di sistema e far riavviare il servizio admin (9443)
+    # mentre risponde: Ansible vede "Remote end closed connection without response"
+    # (status -1). La PUT e' idempotente: riprovo fino a 3 volte a distanza di 30 s.
+    - name: "[settings] Applica configurazione da {{ uag_settings_template }}"
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/settings"
+        method: PUT
+        <<: *api_auth
+        body_format: json
+        body: "{{ uag_settings_body }}"
+        status_code: [200, -1]
+        timeout: 120
+        return_content: true
+      register: settings_put
+      until: settings_put.status == 200
+      retries: 3
+      delay: 30
+      no_log: true          # contiene password OPSWAT/RADIUS
+      tags: [configure, settings]
+
+    # La PUT /config/settings risponde 200 ANCHE se una sezione viene rifiutata
+    # (es. OPSWAT con intervalli non validi -> a cascata niente edge service Horizon).
+    # Gli errori sono solo in admin.log della UAG e nel body della risposta.
+    - name: "[settings] Salva la risposta della PUT (segreti mascherati) in files/backup/"
+      ansible.builtin.copy:
+        content: "{{ settings_put.content | regex_replace('\"(password|sharedSecret|communityName|privateKeyPem)\"\\s*:\\s*\"[^\"]*\"', '\"\\1\": \"***\"') }}"
+        dest: "{{ playbook_dir }}/../files/backup/{{ inventory_hostname }}_settings_put_response.json"
+        mode: "0600"
+      changed_when: false
+      tags: [configure, settings]
+
+    - name: "[settings] Estrai eventuali errori per sezione dalla risposta"
+      ansible.builtin.set_fact:
+        settings_put_errors: >-
+          {{ settings_put.content | regex_findall('[^\"{}]*(?:UAG[WE]\\d{5}|not configured yet|could not be modified|ConstraintViolation|Failed to (?:update|upload|create)|errorStatus|\"status\"\\s*:\\s*\"(?:ERROR|FAIL)[^\"]*\")[^\"{}]*') }}
+      tags: [configure, settings]
+
+    - name: "[settings] Controlla la risposta della PUT (errori per sezione)"
+      ansible.builtin.assert:
+        that: settings_put_errors | length == 0
+        fail_msg: >-
+          La UAG ha rifiutato una o piu' sezioni dei settings:
+          {{ settings_put_errors | join(' | ') }}
+          -- risposta completa in files/backup/{{ inventory_hostname }}_settings_put_response.json
+        quiet: true
+      tags: [configure, settings]
+
+    # La PUT genera piu' restart dell'edge service in pochi secondi mentre il processo
+    # tunnel sta ancora partendo (~50 s): la config del tunnel puo' restare "not yet
+    # complete" (visto il 2026-11-05). Aspetto che sia tutto su e, se serve, ri-applico.
+    - name: "[settings] Attendi che l'edge service Horizon e il tunnel si avviino"
+      ansible.builtin.pause:
+        seconds: 90
+      tags: [configure, settings]
+
+    - name: "[settings] Stato edge service dopo la PUT"
+      ansible.builtin.uri:
+        url: "{{ api_base }}/monitor/stats"
+        method: GET
+        <<: *api_auth
+        status_code: [200]
+        return_content: true
+        timeout: 30
+      register: stats_after_put
+      tags: [configure, settings]
+
+    - name: "[settings] Ri-applica i settings se il tunnel e' rimasto in 'startup configuration not yet complete'"
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/settings"
+        method: PUT
+        <<: *api_auth
+        body_format: json
+        body: "{{ uag_settings_body }}"
+        status_code: [200]
+        timeout: 120
+      when: "'not yet complete' in stats_after_put.content"
+      no_log: true
+      register: settings_reput
+      tags: [configure, settings]
+
+    - name: "[settings] Attendi dopo la ri-applicazione"
+      ansible.builtin.pause:
+        seconds: 60
+      when: settings_reput is not skipped
+      tags: [configure, settings]
+
+    - name: "[settings] Verifica che l'edge service Horizon (VIEW) esista e sia abilitato"
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/edgeservice/VIEW"
+        method: GET
+        <<: *api_auth
+        status_code: [200]
+        return_content: true
+        timeout: 30
+      register: view_cfg
+      failed_when: view_cfg.status != 200 or not (view_cfg.json.enabled | default(false))
+      tags: [configure, settings, verify]
+
+    # ------------------------------------------------------------------
+    # 8. VERIFICA
+    # ------------------------------------------------------------------
+    - name: "[verify] Stato edge service"
+      ansible.builtin.uri:
+        url: "{{ api_base }}/monitor/stats"
+        method: GET
+        <<: *api_auth
+        return_content: true
+        status_code: [200]
+      register: stats
+      tags: [verify]
+
+    - name: "[verify] Dettagli certificato Internet"
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/certs/ssl/details/end_user"
+        method: GET
+        <<: *api_auth
+        return_content: true
+      register: cert_internet
+      tags: [verify]
+
+    - name: "[verify] Dettagli certificato Admin"
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/certs/ssl/details/admin"
+        method: GET
+        <<: *api_auth
+        return_content: true
+      register: cert_admin
+      tags: [verify]
+
+    - name: "[verify] Riepilogo"
+      ansible.builtin.debug:
+        msg:
+          - "Edge service: {{ 'OK' if ('<viewConfigured>true' in stats.content and '<error>' not in stats.content) else 'CONTROLLA ADMIN UI' }}"
+          - "Cert Internet: {{ cert_internet.json | default({}) }}"
+          - "Cert Admin:    {{ cert_admin.json | default({}) }}"
+          - "Quiesce mode nella nuova UAG: OFF (deploy pulito)"
+          - "ORA: test da esterno direttamente su questa UAG (SAML -> OPSWAT -> Blast), poi riabilita sul bilanciatore."
+      tags: [verify]
+
+    - name: "[verify] Conferma prima della UAG successiva"
+      ansible.builtin.pause:
+        prompt: |
+          {{ inventory_hostname }} aggiornata.
+          Fai i test manuali (vedi README sez. 7). Premi INVIO per proseguire con la prossima UAG,
+          oppure Ctrl+C poi A per fermarti qui.
+      tags: [verify]

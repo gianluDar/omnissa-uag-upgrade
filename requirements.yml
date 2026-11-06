@@ -1,0 +1,5 @@
+---
+collections:
+  - name: community.vmware
+    version: ">=4.0.0"
+  - name: ansible.utils

@@ -1,0 +1,72 @@
+---
+# =====================================================================
+#  Variabili COMUNI a tutte le UAG (test e prod), NON segrete.
+#  Cio' che cambia per ambiente (vCenter, rete, DNS, vault, certificati)
+#  sta in group_vars/<env>/main.yml (vedi env_example).
+# =====================================================================
+
+ansible_connection: local
+# Usa lo stesso Python del venv in cui gira ansible-playbook (dove sono installati
+# pyvmomi/requests). Senza questo Ansible "scopre" il python di sistema/homebrew.
+ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+# ---------- Immagine UAG ----------
+# Path LOCALE sul control node (dove gira ansible-playbook).
+# Al prossimo upgrade cambi SOLO questa riga (e uag_version).
+uag_ova: "{{ playbook_dir }}/../files/ova/euc-unified-access-gateway-26.09.0.0-40481840070_OVF10.ova"
+uag_version: "2609"
+
+# ---------- Deploy ----------
+# Profilo OVA: numero di NIC x taglia. Nella OVA 2609: onenic | twonic | threenic,
+# ciascuno anche in variante -large e -XL (es. onenic-large, onenic-XL).
+# Il pre-check verifica che il valore esista nella OVA. Si puo' impostare per
+# ambiente/host in group_vars/host_vars o al volo: -e uag_deployment_option=onenic-large
+# Nota: vCPU/RAM effettive vengono poi ereditate dalla vecchia VM (o da
+# uag_vm_cpus/uag_vm_memory_mb), quindi il profilo conta soprattutto per il numero di NIC.
+uag_deployment_option: "onenic"
+# Taglia della nuova VM. Se NON li imposti, la nuova VM eredita vCPU e RAM della
+# VM attuale (lette da vCenter prima di spegnerla). Impostali in group_vars/host_vars
+# per cambiare taglia (es. uag_vm_cpus: 4, uag_vm_memory_mb: 8192) o da riga di
+# comando: -e uag_vm_cpus=4 -e uag_vm_memory_mb=8192
+# uag_vm_cpus: 4
+# uag_vm_memory_mb: 8192
+uag_disk_provisioning: "thin"
+uag_ceip_enabled: false   # boolean OVF: il playbook lo converte in True/False come vuole vCenter
+uag_ssh_enabled: false
+# uag_ntp: non e' una proprieta' OVF della OVA 2609: l'NTP arriva da systemSettings.ntpServers con la PUT dei settings
+
+# ---------- vCenter (credenziali dal vault dell'ambiente) ----------
+vcenter_username: "{{ vault_vcenter_username }}"
+vcenter_password: "{{ vault_vcenter_password }}"
+vcenter_validate_certs: false
+
+# ---------- Credenziali appliance (dal vault dell'ambiente) ----------
+# Utente OS (console vCenter / SSH). Vuoto = root. Se impostato (es. "uagadmin"), la OVA
+# crea un utente sudo con quel nome, con password = uag_root_password, e DISABILITA root.
+# Solo a-z 0-9 _ - , max 32. Impostalo nel group_vars dell'ambiente.
+uag_os_login_username: ""
+uag_root_password: "{{ vault_uag_root_password }}"     # password di root, o dell'utente OS se sopra e' valorizzato
+uag_admin_password: "{{ vault_uag_admin_password }}"
+uag_api_user: "admin"
+
+# ---------- Certificati TLS: files/certs/<uag_env>/ ----------
+# uag_env (es. "test" | "prod") e' definito nel group_vars dell'ambiente.
+# Interfaccia INTERNET (porta 443, quella vista dai client Horizon)
+uag_cert_internet_chain: "{{ playbook_dir }}/../files/certs/{{ uag_env }}/internet-fullchain.pem"
+uag_cert_internet_key:   "{{ playbook_dir }}/../files/certs/{{ uag_env }}/internet-key.pem"
+# Interfaccia ADMIN (porta 9443). Stesso certificato = stessi file copiati.
+# Se lasci uag_cert_admin_enabled: false la admin resta col self-signed.
+uag_cert_admin_enabled: true
+uag_cert_admin_chain: "{{ playbook_dir }}/../files/certs/{{ uag_env }}/admin-fullchain.pem"
+uag_cert_admin_key:   "{{ playbook_dir }}/../files/certs/{{ uag_env }}/admin-key.pem"
+
+# ---------- SAML ----------
+# I metadati dell'IdP sono GIA' dentro l'export JSON e vengono applicati con la PUT
+# dei settings: non serve nessun file separato. Se l'IdP ha ruotato il certificato
+# di firma dopo l'ultimo export: scripts/refresh_idp_metadata.py (README sez. 3.3).
+
+# ---------- Comportamento playbook ----------
+uag_api_wait_retries: 40      # 40 x 15s = 10 minuti max attesa boot
+uag_api_wait_delay: 15
+uag_quiesce_wait_seconds: 120 # attesa dopo quiesce prima di spegnere la vecchia VM
+uag_keep_old_vm: true         # true = rinomina la vecchia VM in <nome>_OLD_<data> e la spegne

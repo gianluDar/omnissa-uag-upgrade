@@ -1,0 +1,9 @@
+---
+# ---- UAG1 ---- (uno per host; i valori li leggi dall'export: scripts/inspect_export.py)
+uag_vm_name: "UAG1"                 # nome ESATTO della VM in vCenter: viene spenta, rinominata _OLD_<data>, nome riusato
+uag_name: "uag1.example.com"        # systemSettings.uagName nell'export
+uag_mgmt_ip: "10.0.1.11"            # IP usato per l'API admin :9443 (serve gia' per 01_export.yml)
+uag_ip0: "10.0.1.11"                # IP NIC eth0 (= uag_mgmt_ip con onenic)
+uag_netmask0: "255.255.255.0"
+uag_gateway: "10.0.1.1"
+uag_settings_template: "settings/uag1.json.j2"

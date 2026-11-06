@@ -1,0 +1,26 @@
+---
+# Copia questo file in vault.yml, compila, poi cifra:
+#   ansible-vault encrypt inventory/group_vars/<ambiente>/vault.yml
+# Per modificarlo:  ansible-vault edit inventory/group_vars/<ambiente>/vault.yml
+
+vault_vcenter_username: "svc-ansible@vsphere.local"
+vault_vcenter_password: "CAMBIAMI"
+
+# Password root e admin della UAG (requisiti: >= 8 caratteri, maiuscola, minuscola, numero, simbolo)
+vault_uag_root_password: "CAMBIAMI"
+vault_uag_admin_password: "CAMBIAMI"
+
+# OPSWAT MetaDefender IT-OT Access (Endpoint Compliance Check Provider)
+vault_opswat_username: "CAMBIAMI"
+vault_opswat_password: "CAMBIAMI"
+
+# RADIUS (solo se configurato)
+# vault_radius_shared_secret: "CAMBIAMI"
+
+# Chiave privata del certificato SP SAML custom (solo se ne avete caricato uno in
+# Admin UI -> SAML Service Provider Settings). Se usate il self-signed generato
+# dalla UAG lasciate vuoto. Formato: PEM multilinea con il blocco |
+# vault_saml_sp_key: |
+#   -----BEGIN PRIVATE KEY-----
+#   ...
+#   -----END PRIVATE KEY-----

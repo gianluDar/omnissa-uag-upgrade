@@ -1,0 +1,38 @@
+{
+  "_commento": "ESEMPIO della struttura. Sostituisci con l'export reale lavorato da make_settings_template.py",
+  "generalSettings": {
+    "locale": "en_US",
+    "quiesceMode": false
+  },
+  "edgeServiceSettingsList": {
+    "edgeServiceSettingsList": [
+      {
+        "identifier": "VIEW",
+        "enabled": true,
+        "proxyDestinationUrl": "https://horizon-cs.example.com",
+        "proxyDestinationUrlThumbprints": "sha256=AA:BB:...",
+        "authMethods": "saml-auth",
+        "samlSP": "DEMO",
+        "idpEntityID": "https://idp.example.com/saml",
+        "devicePolicyServiceProvider": "OPSWAT",
+        "blastEnabled": true,
+        "blastExternalUrl": "https://horizon.example.com:443",
+        "tunnelEnabled": true,
+        "tunnelExternalUrl": "https://horizon.example.com:443",
+        "pcoipEnabled": false,
+        "blastAllowedHostHeaderValues": "horizon.example.com,uag1.example.com"
+      }
+    ]
+  },
+  "devicePolicySettingsList": {
+    "devicePolicySettingsList": [
+      {
+        "name": "OPSWAT",
+        "hostName": "gears-eu.opswat.com",
+        "userName": "{{ vault_opswat_username }}",
+        "password": "{{ vault_opswat_password }}",
+        "allowedStatuses": ["COMPLIANT"]
+      }
+    ]
+  }
+}

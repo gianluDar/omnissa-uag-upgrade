@@ -1,0 +1,4 @@
+ansible>=9.0
+pyvmomi>=8.0
+requests
+cryptography

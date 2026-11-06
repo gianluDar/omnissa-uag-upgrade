@@ -1,0 +1,72 @@
+---
+# =====================================================================
+#  04_cert_renew.yml - Rinnovo certificato TLS su UAG gia' in esercizio
+#  Carica i PEM in files/certs/ sulle interfacce Internet e Admin.
+#  Nessun riavvio dell'appliance: il servizio ricarica il certificato.
+#  Uso: ansible-playbook playbooks/04_cert_renew.yml
+#       ansible-playbook playbooks/04_cert_renew.yml --tags internet
+# =====================================================================
+- name: Rinnovo certificati UAG
+  hosts: uag
+  gather_facts: false
+  serial: 1
+  vars:
+    api_base: "https://{{ uag_mgmt_ip }}:9443/rest/v1"
+  tasks:
+    - name: Verifica corrispondenza chiave/certificato Internet
+      ansible.builtin.shell: |
+        set -o pipefail
+        c=$(openssl x509 -noout -pubkey -in "{{ uag_cert_internet_chain }}" | openssl md5)
+        k=$(openssl pkey -pubout -in "{{ uag_cert_internet_key }}" | openssl md5)
+        [ "$c" = "$k" ]
+      args:
+        executable: /bin/bash
+      changed_when: false
+      tags: [always]
+
+    - name: Carica certificato INTERNET (end_user)
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/certs/ssl/end_user"
+        method: PUT
+        user: "{{ uag_api_user }}"
+        password: "{{ uag_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          privateKeyPem: "{{ lookup('file', uag_cert_internet_key) }}"
+          certChainPem: "{{ lookup('file', uag_cert_internet_chain) }}"
+        status_code: [200]
+        timeout: 60
+      no_log: true
+      tags: [internet]
+
+    - name: Carica certificato ADMIN
+      ansible.builtin.uri:
+        url: "{{ api_base }}/config/certs/ssl/admin"
+        method: PUT
+        user: "{{ uag_api_user }}"
+        password: "{{ uag_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          privateKeyPem: "{{ lookup('file', uag_cert_admin_key) }}"
+          certChainPem: "{{ lookup('file', uag_cert_admin_chain) }}"
+        status_code: [200]
+        timeout: 60
+      when: uag_cert_admin_enabled | bool
+      no_log: true
+      tags: [admin]
+
+    - name: Verifica certificato Internet esposto sulla 443
+      ansible.builtin.shell: |
+        echo | openssl s_client -connect {{ uag_ip0 }}:443 -servername {{ uag_ip0 }} 2>/dev/null | openssl x509 -noout -subject -enddate
+      changed_when: false
+      register: live_cert
+      tags: [always]
+
+    - name: Risultato
+      ansible.builtin.debug:
+        var: live_cert.stdout_lines
+      tags: [always]
