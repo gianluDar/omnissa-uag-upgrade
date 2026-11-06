@@ -1,0 +1,16 @@
+# Segreti e materiale sensibile: MAI nel repo
+.vault_pass
+files/certs/**/*.pem
+files/certs/**/*.key
+files/certs/**/*.cer
+files/ova/*
+!files/ova/.gitkeep
+files/backup/*
+!files/backup/.gitkeep
+files/config/*
+!files/config/.gitkeep
+# Il vault cifrato PUO' stare nel repo, ma il file in chiaro no
+inventory/group_vars/*/vault.yml.decrypted
+*.retry
+__pycache__/
+uag_automation_templ/
