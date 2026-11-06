@@ -1,4 +1,4 @@
-# uag-automation
+# Omnissa UAG (Unified Access Gateway) Automation Upgrade Tool with Ansible
 
 Ansible automation for upgrading **Omnissa Unified Access Gateway** (UAG) appliances used
 with Horizon 8: export the running configuration, deploy the new OVA on vSphere, re-apply
