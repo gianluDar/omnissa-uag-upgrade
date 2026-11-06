@@ -1,4 +1,4 @@
-# Omnissa UAG (Unified Access Gateway) Upgrade Tool with Ansible on VMware
+# uag-automation
 
 Ansible automation for upgrading **Omnissa Unified Access Gateway** (UAG) appliances used
 with Horizon 8: export the running configuration, deploy the new OVA on vSphere, re-apply
@@ -10,6 +10,22 @@ certificates and settings through the UAG admin REST API, verify. Written for th
 > **one UAG at a time**, with the old VM kept for rollback.
 
 Comments inside playbooks and scripts are in Italian.
+
+## Disclaimer
+
+This is an independent, community project. It is **not** an official Omnissa product, it is not
+affiliated with, endorsed or supported by Omnissa, VMware or Broadcom, and it is not covered by any
+vendor support contract. "Omnissa", "Unified Access Gateway", "Horizon", "VMware" and "vSphere" are
+trademarks of their respective owners and are used here only to identify the products the playbooks
+work with. The playbooks drive the publicly documented UAG admin REST API and vSphere OVF deployment;
+behaviour described in this README was observed on specific releases (UAG 25.03 → 2609, Horizon 2503.1)
+and may differ on other versions.
+
+The software is provided "as is", without warranty of any kind (see `LICENSE`). It powers off, renames
+and replaces virtual machines and rewrites the full configuration of network appliances: **test it in a
+non-production environment first**, read the playbooks before running them, keep the `_OLD_` VMs until
+you are sure, and always run one appliance at a time behind a load balancer. You are responsible for
+what it does in your environment.
 
 ## What it does
 
@@ -84,11 +100,47 @@ Useful tags and overrides:
 
 ```bash
 ansible-playbook playbooks/02_upgrade.yml -l <host> --tags settings            # re-apply settings only
-ansible-playbook playbooks/02_upgrade.yml -l <host> --tags cert                # certificates only
+ansible-playbook playbooks/02_upgrade.yml -l <host> --tags cert                # certificates only (on a freshly deployed UAG)
+ansible-playbook playbooks/04_cert_renew.yml -l <host>                         # certificate renewal on a running UAG (see below)
 ansible-playbook playbooks/02_upgrade.yml -l <host> -e uag_vm_cpus=4 -e uag_vm_memory_mb=8192
 ansible-playbook playbooks/02_upgrade.yml -l <host> -e uag_deployment_option=onenic-large
 ansible-playbook playbooks/02_upgrade.yml -l <host> --check -e uag_regenerate_template=true
 ```
+
+## Certificate renewal (no redeploy)
+
+When the public certificate expires you don't need a new appliance: `04_cert_renew.yml` uploads a
+renewed certificate on the Internet interface (443, seen by Horizon clients) and on the Admin
+interface (9443) of each UAG, one at a time, with no appliance reboot. The UAG has **two**
+separate TLS certificates; the playbook pushes both, but you can limit it with tags.
+
+```bash
+# 1. prepare the PEM files in files/certs/<uag_env>/
+#    fullchain = leaf certificate followed by the intermediate(s); 2609 wants the full chain.
+cat cert.pem intermediate.pem > files/certs/<uag_env>/internet-fullchain.pem
+cp key.pem files/certs/<uag_env>/internet-key.pem            # unencrypted key (BEGIN PRIVATE KEY / BEGIN RSA PRIVATE KEY)
+openssl verify -CAfile intermediate.pem cert.pem             # must say OK
+# same certificate on the admin interface? copy the files (or set uag_cert_admin_enabled: false to skip it)
+cp files/certs/<uag_env>/internet-fullchain.pem files/certs/<uag_env>/admin-fullchain.pem
+cp files/certs/<uag_env>/internet-key.pem       files/certs/<uag_env>/admin-key.pem
+
+# 2. renew, one UAG at a time (the playbook checks that key and certificate match first)
+ansible-playbook playbooks/04_cert_renew.yml -l <host>           # Internet + Admin
+ansible-playbook playbooks/04_cert_renew.yml -l <group>          # every UAG of an environment, serially
+ansible-playbook playbooks/04_cert_renew.yml -l <host> --tags internet   # Internet interface only
+ansible-playbook playbooks/04_cert_renew.yml -l <host> --tags admin      # Admin interface only
+
+# 3. verify what the appliance now serves
+ansible-playbook playbooks/03_verify.yml -l <host>
+openssl s_client -connect <uag-fqdn>:443 </dev/null | openssl x509 -noout -subject -enddate
+```
+
+Notes: the upload on the Admin interface restarts the admin service on 9443 for a few seconds
+(the playbook waits for it to come back); no user session is affected. If the key is encrypted,
+decrypt it first with `openssl pkey -in key-enc.pem -out files/certs/<uag_env>/internet-key.pem`.
+Check the expiry of the IdP signing certificate too: it lives inside the SAML metadata in the
+settings, not in these files (`scripts/inspect_export.py` reports it; `scripts/refresh_idp_metadata.py`
+updates it in the template).
 
 ## What the export does not contain
 
